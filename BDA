@@ -376,4 +376,129 @@ For evaluation: MulticlassClassificationEvaluator with "accuracy" and "f1"
 For hyperparameter tuning: ParamGridBuilder() and TrainValidationSplit()
 Sequence Practice:
 
-Practice writing out the sequence of import → load → transform → train → evaluate without looking at your notes.
+The document details a PySpark workflow for entity resolution, which is used to identify and merge records representing the same entity across datasets. I’ll break down the code sections to clarify each part’s function and suggest tips for memorization.
+
+1. Setting Up Spark and Importing Data
+python
+Copy code
+import os
+import sys
+from pyspark.sql import SparkSession
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+spark = SparkSession.builder.config("spark.driver.memory", "16g").appName('EntityResolution').getOrCreate()
+
+parsed = spark.read.option("header", "true").option("nullValue", "?").option("inferSchema", "true").csv("data/linkage.csv")
+parsed.printSchema()
+parsed.show(5)
+parsed.count()
+parsed.cache()
+Explanation:
+Creates a Spark session, reads the CSV file, and caches it for faster access.
+option("header", "true") means the file has headers, nullValue="?" replaces ? with null, and inferSchema="true" infers data types.
+Tip: Memorize header, nullValue, and inferSchema for reading CSVs with PySpark. cache() is useful to speed up repeated access.
+2. Basic Data Exploration and SQL Queries
+python
+Copy code
+from pyspark.sql.functions import col
+parsed.groupBy("is_match").count().orderBy(col("count").desc()).show()
+
+parsed.createOrReplaceTempView("linkage")
+spark.sql("""
+    SELECT is_match, COUNT(*) cnt
+    FROM linkage
+    GROUP BY is_match
+    ORDER BY cnt DESC
+""").show()
+Explanation:
+Aggregates rows by is_match to check how many records are matches vs. non-matches.
+SQL allows running queries on Spark DataFrames using createOrReplaceTempView.
+Tip: Use groupBy().count() for counting unique values and createOrReplaceTempView to analyze data with SQL syntax.
+3. Summary Statistics and Filtering Matches
+python
+Copy code
+summary = parsed.describe()
+summary.select("summary", "cmp_fname_c1", "cmp_fname_c2").show()
+
+matches = parsed.where("is_match = true")
+match_summary = matches.describe()
+misses = parsed.filter(col("is_match") == False)
+miss_summary = misses.describe()
+Explanation:
+describe() provides summary statistics for each column, which helps understand data distribution.
+Filtering by is_match isolates matched and non-matched records for separate analysis.
+Tip: Remember describe() for summary statistics, and where or filter to create subsets of data based on conditions.
+4. Transposing and Pivoting Summary Data
+python
+Copy code
+summary_p = summary.toPandas()
+summary_p = summary_p.set_index('summary').transpose().reset_index()
+summary_p = summary_p.rename(columns={'index':'field'}).rename_axis(None, axis=1)
+
+summaryT = spark.createDataFrame(summary_p)
+from pyspark.sql.types import DoubleType
+for c in summaryT.columns:
+    if c != 'field':
+        summaryT = summaryT.withColumn(c, summaryT[c].cast(DoubleType()))
+summaryT.printSchema()
+Explanation:
+Converts Spark DataFrame to Pandas for transposing, which switches rows and columns for easier comparison.
+Converts back to Spark DataFrame and casts numeric columns to DoubleType.
+Tip: When manipulating data structure, converting to Pandas can simplify operations like transposing.
+5. Creating a Pivot Function for Summaries
+python
+Copy code
+from pyspark.sql import DataFrame
+
+def pivot_summary(desc: DataFrame) -> DataFrame:
+    desc_p = desc.toPandas()
+    desc_p = desc_p.set_index('summary').transpose().reset_index().rename(columns={'index': 'field'}).rename_axis(None, axis=1)
+    descT = spark.createDataFrame(desc_p)
+    for c in descT.columns:
+        if c != 'field':
+            descT = descT.withColumn(c, descT[c].cast(DoubleType()))
+    return descT
+Explanation:
+Consolidates the process of pivoting and casting numeric columns into a reusable function.
+Tip: Recognize pivot_summary as a helper function for transforming summary data.
+6. Feature Selection Using SQL Joins
+python
+Copy code
+match_summaryT = pivot_summary(match_summary)
+miss_summaryT = pivot_summary(miss_summary)
+
+match_summaryT.createOrReplaceTempView("match_desc")
+miss_summaryT.createOrReplaceTempView("miss_desc")
+
+spark.sql("""
+    SELECT a.field, a.count + b.count total, a.mean - b.mean delta
+    FROM match_desc a INNER JOIN miss_desc b ON a.field = b.field
+    WHERE a.field NOT IN ("id_1", "id_2")
+    ORDER BY delta DESC, total DESC
+""").show()
+Explanation:
+Joins summary tables for matches and misses, calculates the difference in means (delta), and ranks features by relevance.
+Tip: Use INNER JOIN with SQL for combining tables, focusing on fields that have the most significant delta as key features.
+7. Scoring Records Based on Selected Features
+python
+Copy code
+good_features = ["cmp_lname_c1", "cmp_plz", "cmp_by", "cmp_bd", "cmp_bm"]
+sum_expression = " + ".join(good_features)
+
+from pyspark.sql.functions import expr
+scored = parsed.fillna(0, subset=good_features).withColumn('score', expr(sum_expression)).select('score', 'is_match')
+scored.show()
+Explanation:
+Defines a list of “good features” based on the previous analysis. Creates an expression to sum these features and adds it as a score column.
+Tip: Remember fillna(0) to handle missing values, and expr() to create a calculated column based on feature importance.
+8. Choosing the Threshold with Cross Tabulation
+python
+Copy code
+def crossTabs(scored: DataFrame, t: float) -> DataFrame:
+    return scored.selectExpr(f"score >= {t} as above", "is_match").groupBy("above").pivot("is_match", ("true", "false")).count()
+
+crossTabs(scored, 4.0).show()
+crossTabs(scored, 2.0).show()
+Explanation:
+crossTabs function creates a confusion matrix for different threshold values, helping determine the best threshold for separating matches.
+Tip: Use cross-tabulation (groupBy().pivot()) to evaluate classification performance at different thresholds.
